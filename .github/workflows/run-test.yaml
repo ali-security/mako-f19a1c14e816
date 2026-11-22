@@ -1,25 +1,27 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2022-11-15T14:37:53.675556Z@time-machines-pypi.sealsecurity.io/
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
         os:
-          - "ubuntu-latest"
+          # ubuntu-latest (26.04) has no prebuilt CPython 3.7-3.9; 22.04 still does
+          - "ubuntu-22.04"
           - "windows-latest"
           - "macos-latest"
         python-version:
@@ -34,6 +36,13 @@ jobs:
           - os: "windows-latest"
             python-version: "3.10"
 
+        include:
+          # arm64 macOS has no CPython 3.7 build (and openssl@1.1 is gone, so it
+          # cannot be compiled); run the x64 build under Rosetta instead
+          - os: "macos-latest"
+            python-version: "3.7"
+            architecture: "x64"
+
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
@@ -41,17 +50,64 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v2
 
+      - name: Set up conda (x64 CPython 3.7 on arm64 macOS)
+        # the actions/python-versions x64 3.7 build links /usr/local/opt/gettext,
+        # absent on the arm64 image; conda-forge's osx-64 3.7 is self-contained
+        if: matrix.architecture == 'x64'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          architecture: x64
+          python-version: ${{ matrix.python-version }}
+          activate-environment: py
+          auto-activate-base: false
+
+      - name: Put the conda python on PATH
+        if: matrix.architecture == 'x64'
+        shell: bash -el {0}
+        run: |
+          python -c "import sys, platform; print(sys.version, platform.machine())"
+          echo "$CONDA_PREFIX/bin" >> "$GITHUB_PATH"
+
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: matrix.architecture != 'x64'
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade tox setuptools
+          pip install --upgrade tox "setuptools==65.5.1"
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- -rfsxX ${{ inputs.test-filter }}
+
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        run: |
+          # release builds drop the "dev" egg_info tag (the public sdist's setup.cfg has tag_build empty)
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          # the release sdist ships the rendered HTML docs (doc/*.html, doc/_static);
+          # build them in place with the docs Makefile's dist-html target first.
+          # doc/build/requirements.txt installs these from git master; pin each to
+          # its last commit before the 1.2.4 release (2022-11-15)
+          python -m pip install \
+            "changelog @ git+https://github.com/sqlalchemyorg/changelog.git@66e3e124386550e1d6c5c1b3a7a88b9d3dc2046a" \
+            "sphinx-paramlinks @ git+https://github.com/sqlalchemyorg/sphinx-paramlinks.git@31220524adf33128860806f9c19c06f9f28fa04e" \
+            "zzzeeksphinx @ git+https://github.com/sqlalchemyorg/zzzeeksphinx.git@4ce5455e281bf27e9609af6f12358fe680dc193d"
+          make -C doc/build dist-html
+          python -m pip install build
+          python -m build
+
+      - name: Upload dist
+        if: matrix.os == 'ubuntu-22.04' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
